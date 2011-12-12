@@ -69,10 +69,10 @@ func genRoutes() []artichoke.Route {
 
 				var err error
 				var res []byte
-				id := params["docid"]
-				if id != "" {
+				docid := params["docid"]
+				if docid != "" {
 					var out map[string]interface{}
-					err := c.Find(bson.M{"_id": id}).One(&out)
+					err := c.Find(bson.M{"_id": bson.ObjectIdHex(docid)}).One(&out)
 					if err != nil {
 						w.WriteHeader(500)
 						w.Write([]byte("Error getting document by id"))
