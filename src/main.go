@@ -34,6 +34,43 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, fmt.Sprintf("{\"error\":\"%s\"}", message))
 }
 
+func decodeId(strId string, query url.Values, w http.ResponseWriter) (interface{}, bool) {
+	var id interface{}
+	// default to hex if hexId isn't present
+	if query.Get("hexId") == "false" {
+		id = strId
+	} else {
+		str, err := hex.DecodeString(strId)
+		if err != nil {
+			writeError(w, 500, "Unable to convert supplied string to hex format")
+			return nil, true
+		} else if !bson.ObjectId(str).Valid() {
+			writeError(w, 400, "Invalid hex string. Maybe you meant to pass the query param hexId=false?")
+			return nil, true
+		}
+
+		id = bson.ObjectId(str)
+	}
+
+	return id, false
+}
+
+func insert(data interface{}, c *mgo.Collection, w http.ResponseWriter) {
+	err := c.Insert(data)
+	if err != nil {
+		writeError(w, 500, "Document insertion failed")
+		return
+	}
+
+	res, err := json.Marshal(data)
+	if err != nil {
+		writeError(w, 500, "Error stringifying query result")
+		return
+	}
+
+	writeJSON(w, 201, string(res))
+}
+
 func genRoutes() []artichoke.Route {
 
 	/*
@@ -57,21 +94,9 @@ func genRoutes() []artichoke.Route {
 
 				c := session.DB(params["db"]).C(params["collection"])
 
-				var id interface{}
-				// default to hex if hexId isn't present
-				if query.Get("hexId") == "false" {
-					id = params["docid"]
-				} else {
-					str, err := hex.DecodeString(params["docid"])
-					if err != nil {
-						writeError(w, 500, "Unable to convert supplied string to hex format")
-						return true
-					} else if !bson.ObjectId(str).Valid() {
-						writeError(w, 400, "Invalid hex string. Maybe you meant to pass the query param hexId=false?")
-						return true
-					}
-
-					id = bson.ObjectId(str)
+				id, resEnded := decodeId(params["docid"], query, w)
+				if (resEnded) {
+					return true
 				}
 
 				// we'll need this query later
@@ -203,20 +228,9 @@ func genRoutes() []artichoke.Route {
 
 				c := s.DB(params["db"]).C(params["collection"])
 
-				var id interface{}
-				if query.Get("hexId") == "false" {
-					id = params["docid"]
-				} else {
-					str, err := hex.DecodeString(params["docid"])
-					if err != nil {
-						writeError(w, 500, "Unable to convert supplied string to hex format")
-						return true
-					} else if !bson.ObjectId(str).Valid() {
-						writeError(w, 400, "Invalid hex string. Maybe you meant to pass the query param hexId=false?")
-						return true
-					}
-
-					id = bson.ObjectId(str)
+				id, resEnded := decodeId(params["docid"], query, w)
+				if (resEnded) {
+					return true
 				}
 
 				obj := bson.M{"_id": id}
@@ -294,6 +308,64 @@ func genRoutes() []artichoke.Route {
 			},
 		},
 
+		/* POST Requests */
+
+		// Update a document in place. This will return an error if the document does not exist.
+		artichoke.Route{
+			Method: "POST",
+			Pattern: "/:db/:collection",
+			Handler: func(w http.ResponseWriter, r *http.Request, m artichoke.Data) bool {
+				fmt.Println("Post handler called")
+
+				// create a new session per connection
+				s := session.New()
+				defer s.Close()
+
+				// get the params and query objects
+				params := m["params"].(map[string]string)
+				query := m["query"].(url.Values)
+
+				// get the colletion
+				c := s.DB(params["db"]).C(params["collection"])
+
+				body := m["bodyJson"].(map[string]interface{})
+				if body["_id"] != nil {
+					id, resEnded := decodeId(body["_id"].(string), query, w)
+					if (resEnded) {
+						return true
+					}
+
+					// ensure that body has the correct id
+					body["_id"] = id
+
+					// update, if possible
+					err := c.Update(bson.M{"_id": id}, body)
+					if err == mgo.NotFound {
+						insert(body, &c, w)
+						return true
+					} else if err != nil {
+						writeError(w, 500, "Error updating document in database")
+						return true
+					} else {
+						// update succeeded
+						// TODO: make this return the current data in the database?
+						w.Header().Add("Content-Length", "0")
+						w.WriteHeader(204)
+						return true
+					}
+				} else {
+					// generate a new ObjectId
+					body["_id"] = bson.NewObjectId()
+
+					// and create it
+					insert(body, &c, w)
+					return true
+				}
+
+				return false
+			},
+		},
+
 		/* PUT Requests */
 
 		// Since databases and collections are created on-the-fly, there's no PUT for a database or collection.
@@ -306,6 +378,12 @@ func genRoutes() []artichoke.Route {
 			Method: "PUT",
 			Pattern: "/:db/:collection/:docid",
 			Handler: func(w http.ResponseWriter, r *http.Request, m artichoke.Data) bool {
+				_, bodyExists := m["bodyJson"]
+				if !bodyExists {
+					writeError(w, 400, "No valid body supplied or body sent with the wrong content-type. Must send as application/json.")
+					return true
+				}
+
 				// create a new session per connection
 				s := session.New()
 				defer s.Close()
@@ -314,20 +392,9 @@ func genRoutes() []artichoke.Route {
 				params := m["params"].(map[string]string)
 				query := m["query"].(url.Values)
 
-				var id interface{}
-				if query.Get("hexId") == "false" {
-					id = params["docid"]
-				} else {
-					str, err := hex.DecodeString(params["docid"])
-					if err != nil {
-						writeError(w, 500, "Unable to convert supplied string to hex format")
-						return true
-					} else if !bson.ObjectId(str).Valid() {
-						writeError(w, 400, "Invalid hex string. Maybe you meant to pass the query param hexId=false?")
-						return true
-					}
-
-					id = bson.ObjectId(str)
+				id, resEnded := decodeId(params["docid"], query, w)
+				if (resEnded) {
+					return true
 				}
 
 				// get the collection so we can check if the id exists
@@ -344,21 +411,25 @@ func genRoutes() []artichoke.Route {
 				body := m["bodyJson"].(map[string]interface{})
 				body["_id"] = id
 
+				// get the preferred status code
+				var status int
+				if n > 0 {
+					status = 204
+				} else {
+					status = 201
+				}
+
 				// insert into the database
+				// we won't use the one defined above, because we don't want to return anything to the user
 				err = c.Insert(body)
 				if err != nil {
 					writeError(w, 500, "Error inserting document into database")
 					return true
 				}
 
+				// PUT requests should not return anything on success
 				w.Header().Add("Content-Length", "0")
-				if n > 0 {
-					w.WriteHeader(204)
-					return true
-				} else {
-					w.WriteHeader(201)
-				}
-
+				w.WriteHeader(status)
 				return true
 			},
 		},
