@@ -14,112 +14,100 @@ import (
 var session *mgo.Session
 var kill chan bool = make(chan bool)
 
-func printJson(j interface{}) string {
-	switch j.(type) {
-		case bool:
-			return strconv.FormatBool(j.(bool))
+func writeJSON(w http.ResponseWriter, status int, message string) {
+	// write headers
+	header := w.Header()
+	header.Add("Content-Length", strconv.Itoa(len(message)))
+	header.Add("Content-Type", "application/json")
 
-		case float64:
-			return strconv.FormatFloat(j.(float64), 'g', -1, 64)
+	// write status code
+	w.WriteHeader(status)
 
-		case string:
-			return "\"" + j.(string) + "\""
+	// write data
+	w.Write([]byte(message))
+}
 
-		case []interface{}:
-			t := j.([]interface{})
-			s := make([]string, len(t))
-
-			for i, val := range t {
-				s[i + 1] = printJson(val)
-			}
-
-			return fmt.Sprintf("[%s]", strings.Join(s, ","))
-
-		case map[string]interface{}:
-			m := j.(map[string]interface{})
-			s := make([]string, len(m))
-
-			i := 0
-			for k, v := range m {
-				s[i] = fmt.Sprintf("\"%s\":%s", k, printJson(v))
-				i += 1
-			}
-
-			return fmt.Sprintf("{%s}", strings.Join(s, ","))
-
-		case nil:
-			return "null"
-	}
-
-	return ""
+func writeError(w http.ResponseWriter, status int, message string) {
+	// do the same as a regular response, but manually format as JSON
+	writeJSON(w, status, fmt.Sprintf("{\"error\":\"%s\"}", message))
 }
 
 func genRoutes() []artichoke.Route {
+
+	/*
+		Order of the requests are important. They will be executed top-down.
+	 */
+
 	return []artichoke.Route{
+
+		/* GET requests */
+
 		artichoke.Route{
 			Method: "GET",
-			Pattern: "/:db/:collection/?:docid?",
+			Pattern: "/:db/:collection/:docid",
 			Handler: func (w http.ResponseWriter, r *http.Request, m artichoke.Data) bool {
 				// create a new session based on the global one; this allows different login details
 				s := session.New()
 				defer s.Close()
 
 				params := m["params"].(map[string]string)
-				c := session.DB(params["db"]).C(params["collection"])
 
-				var err error
-				var res []byte
-				docid := params["docid"]
-				if docid != "" {
-					var out map[string]interface{}
-					err := c.Find(bson.M{"_id": bson.ObjectIdHex(docid)}).One(&out)
-					if err != nil {
-						w.WriteHeader(500)
-						w.Write([]byte("Error getting document by id"))
-						w.Write([]byte(""))
-						return true
-					}
-
-					res, err = json.Marshal(out)
-				} else {
-					js := m["bodyJson"]
-					if js != nil {
-						var out []map[string]interface{}
-						err := c.Find(js).All(&out)
-						if err != nil {
-							w.WriteHeader(500)
-							w.Write([]byte("Error with query"))
-							w.Write([]byte(""))
-							return true
-						}
-
-						res, err = json.Marshal(out)
-					} else {
-						var out []map[string]interface{}
-						err := c.Find(nil).All(&out)
-						if err != nil {
-							w.WriteHeader(500)
-							w.Write([]byte("Error getting all documents")) 
-							w.Write([]byte(""))
-							return true
-						}
-
-						res, err = json.Marshal(out)
-					}
-				}
-
+				// we don't know the structure before-hand, but we know it's a JSON object
+				var out map[string]interface{}
+				err := session.DB(params["db"]).C(params["collection"]).Find(bson.M{"_id": bson.ObjectIdHex(params["docid"])}).One(&out)
 				if err != nil {
-					w.WriteHeader(500)
-					w.Write([]byte("Error stringifying query result"))
-					w.Write([]byte(""))
+					writeError(w, 500, "Error getting document by id")
 					return true
 				}
 
-				w.WriteHeader(200)
-				w.Write(res)
-				w.Write([]byte(""))
+				res, err := json.Marshal(out)
+				if err != nil {
+					writeError(w, 500, "Error stringifying query result")
+					return true
+				}
 
+				writeJSON(w, 200, string(res))
 				return true
+			},
+		},
+		artichoke.Route{
+			Method: "GET",
+			Pattern: "/:db/:collection",
+			Handler: func (w http.ResponseWriter, r *http.Request, m artichoke.Data) bool {
+				// create a new session based on the global one; this allows different login details
+				s := session.New()
+				defer s.Close()
+
+				// get the collection the user specified
+				params := m["params"].(map[string]string)
+				c := session.DB(params["db"]).C(params["collection"])
+
+				// check for query params
+				js := m["query"]
+				if js != nil {
+					// not yet implemented
+					writeError(w, 500, "Query params not supported yet")
+					return true
+				} else {
+					// no query parameters means they want everything in the collection
+					var out []map[string]interface{}
+					err := c.Find(nil).All(&out)
+					if err != nil {
+						writeError(w, 500, "Error getting all documents")
+						return true
+					}
+
+					res, err := json.Marshal(out)
+					if err != nil {
+						writeError(w, 500, "Error stringifying response")
+						return true
+					}
+
+					writeJSON(w, 200, string(res))
+					return true
+				}
+
+				return false
 			},
 		},
 		artichoke.Route{
@@ -133,15 +121,11 @@ func genRoutes() []artichoke.Route {
 				params := m["params"].(map[string]string)
 				names, err := session.DB(params["db"]).CollectionNames()
 				if err != nil {
-					w.WriteHeader(500)
-					w.Write([]byte("Error getting collection names"))
-					w.Write([]byte(""))
+					writeError(w, 500, "Error getting collection names")
 					return true
 				}
 
-				w.WriteHeader(200)
-				w.Write([]byte(fmt.Sprintf("[%s]", strings.Join(names, ","))))
-				w.Write([]byte(""))
+				writeJSON(w, 200, fmt.Sprintf("[%s]", strings.Join(names, ",")))
 				return true
 			},
 		},
@@ -155,15 +139,11 @@ func genRoutes() []artichoke.Route {
 
 				names, err := s.DatabaseNames()
 				if err != nil {
-					w.WriteHeader(500)
-					w.Write([]byte("Error getting database names"))
-					w.Write([]byte(""))
+					writeError(w, 500, "Error getting database names")
 					return true
 				}
 
-				w.WriteHeader(200)
-				w.Write([]byte(fmt.Sprintf("[%s]", strings.Join(names, ","))))
-				w.Write([]byte(""))
+				writeJSON(w, 200, fmt.Sprintf("[%s]", strings.Join(names, ",")))
 				return true
 			},
 		},
